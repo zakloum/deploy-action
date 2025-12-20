@@ -1,0 +1,161 @@
+name: 'Docker Build, Push and Deploy'
+description: 'Build and push Docker image to GitHub Container Registry and optionally trigger Render deployment'
+author: 'zakloum'
+
+inputs:
+  registry:
+    description: 'Container registry (e.g., ghcr.io)'
+    required: false
+    default: 'ghcr.io'
+  image-name:
+    description: 'Docker image name (e.g., ghcr.io/owner/repo)'
+    required: true
+  ghcr-username:
+    description: 'GitHub Container Registry username'
+    required: true
+  ghcr-token:
+    description: 'GitHub Container Registry token'
+    required: true
+  dockerfile:
+    description: 'Path to Dockerfile'
+    required: false
+    default: 'Dockerfile.ci'
+  docker-context:
+    description: 'Docker build context path'
+    required: false
+    default: '.'
+  platform:
+    description: 'Target platform for Docker build'
+    required: false
+    default: 'linux/amd64'
+  enable-render-deployment:
+    description: 'Enable Render deployment trigger'
+    required: false
+    default: 'false'
+  render-deploy-hook:
+    description: 'Render deployment hook URL'
+    required: false
+  deploy-on-branch:
+    description: 'Branch name to trigger deployment (e.g., master, main)'
+    required: false
+    default: 'master'
+  additional-tags:
+    description: 'Additional Docker tags to push (comma-separated)'
+    required: false
+    default: ''
+
+outputs:
+  image-url:
+    description: 'Full URL of the pushed Docker image'
+    value: ${{ steps.set-output.outputs.image-url }}
+  deployment-status:
+    description: 'Status of Render deployment (success, failed, skipped)'
+    value: ${{ steps.deploy.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.ghcr-username }}
+        password: ${{ inputs.ghcr-token }}
+
+    - name: Verify JAR exists
+      shell: bash
+      run: |
+        ls -la target/
+        echo "JAR file location:"
+        find . -name "*.jar" -type f
+
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ inputs.image-name }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      shell: bash
+      run: |
+        echo "Building Docker image from context: ${{ inputs.docker-context }}"
+        ls -la ${{ inputs.docker-context }}
+
+        # Build and push with latest tag
+        docker build \
+          --platform=${{ inputs.platform }} \
+          --no-cache \
+          -f ${{ inputs.dockerfile }} \
+          -t ${{ inputs.image-name }}:latest \
+          ${{ inputs.docker-context }}
+
+        docker push ${{ inputs.image-name }}:latest
+
+        # Push additional tags if on deployment branch
+        if [ "${{ github.ref }}" = "refs/heads/${{ inputs.deploy-on-branch }}" ]; then
+          docker tag ${{ inputs.image-name }}:latest ${{ inputs.image-name }}:${{ inputs.deploy-on-branch }}
+          docker push ${{ inputs.image-name }}:${{ inputs.deploy-on-branch }}
+        fi
+
+        # Push any additional custom tags
+        if [ -n "${{ inputs.additional-tags }}" ]; then
+          IFS=',' read -ra TAGS <<< "${{ inputs.additional-tags }}"
+          for tag in "${TAGS[@]}"; do
+            tag=$(echo "$tag" | xargs) # trim whitespace
+            if [ -n "$tag" ]; then
+              echo "Pushing additional tag: $tag"
+              docker tag ${{ inputs.image-name }}:latest ${{ inputs.image-name }}:$tag
+              docker push ${{ inputs.image-name }}:$tag
+            fi
+          done
+        fi
+
+    - name: Set output values
+      id: set-output
+      shell: bash
+      run: |
+        echo "image-url=${{ inputs.image-name }}:latest" >> $GITHUB_OUTPUT
+
+    - name: Trigger Render deployment
+      id: deploy
+      if: inputs.enable-render-deployment == 'true' && github.ref == format('refs/heads/{0}', inputs.deploy-on-branch) && github.event_name == 'push'
+      shell: bash
+      run: |
+        echo "Triggering Render deployment with latest image..."
+
+        # Extract image name for URL encoding
+        IMAGE_NAME="${{ inputs.image-name }}:latest"
+        # URL encode the image URL
+        IMAGE_URL_ENCODED=$(echo "$IMAGE_NAME" | sed 's/\//%2F/g' | sed 's/:/%3A/g')
+        DEPLOY_HOOK_URL="${{ inputs.render-deploy-hook }}&imgURL=${IMAGE_URL_ENCODED}"
+
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$DEPLOY_HOOK_URL")
+        HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+        BODY=$(echo "$RESPONSE" | head -n-1)
+
+        echo "Response: $BODY"
+        echo "HTTP Status: $HTTP_CODE"
+
+        if [ "$HTTP_CODE" = "200" ]; then
+          echo "✓ Render deployment triggered successfully"
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "✗ Failed to trigger Render deployment (HTTP $HTTP_CODE)"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: Set deployment status if skipped
+      if: inputs.enable-render-deployment != 'true' || github.ref != format('refs/heads/{0}', inputs.deploy-on-branch) || github.event_name != 'push'
+      shell: bash
+      run: |
+        echo "status=skipped" >> $GITHUB_OUTPUT
+
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
