@@ -123,7 +123,7 @@ runs:
 
     - name: Trigger Render deployment
       id: deploy
-      if: inputs.enable-render-deployment == 'true' && github.ref == format('refs/heads/{0}', inputs.deploy-on-branch) && github.event_name == 'push'
+      if: inputs.enable-render-deployment == 'true' && github.ref == format('refs/heads/{0}', inputs.deploy-on-branch) && (github.event_name == 'push' || github.event_name == 'pull_request')
       shell: bash
       run: |
         echo "Triggering Render deployment with latest image..."
@@ -151,7 +151,7 @@ runs:
         fi
 
     - name: Set deployment status if skipped
-      if: inputs.enable-render-deployment != 'true' || github.ref != format('refs/heads/{0}', inputs.deploy-on-branch) || github.event_name != 'push'
+      if: inputs.enable-render-deployment != 'true' || github.ref != format('refs/heads/{0}', inputs.deploy-on-branch) || (github.event_name != 'push' && github.event_name != 'pull_request')
       shell: bash
       run: |
         echo "status=skipped" >> $GITHUB_OUTPUT
