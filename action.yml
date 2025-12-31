@@ -1,5 +1,5 @@
-name: 'Docker Build, Push and Deploy'
-description: 'Build and push Docker image to GitHub Container Registry and optionally trigger Render deployment'
+name: 'Docker Build, Push and Helm Chart to OCI'
+description: 'Build and push Docker image to GitHub Container Registry and push Helm chart to GitHub OCI registry'
 author: 'zakloum'
 
 inputs:
@@ -28,17 +28,17 @@ inputs:
     description: 'Target platform for Docker build'
     required: false
     default: 'linux/amd64'
-  enable-render-deployment:
-    description: 'Enable Render deployment trigger'
+  helm-chart-path:
+    description: 'Path to Helm chart directory'
     required: false
-    default: 'false'
-  render-deploy-hook:
-    description: 'Render deployment hook URL'
+    default: './helm'
+  helm-chart-name:
+    description: 'Name of the Helm chart'
+    required: true
+  chart-version:
+    description: 'Version for the Helm chart (uses JAR version if not provided)'
     required: false
-  deploy-on-branch:
-    description: 'Branch name to trigger deployment (e.g., master, main)'
-    required: false
-    default: 'master'
+    default: ''
   additional-tags:
     description: 'Additional Docker tags to push (comma-separated)'
     required: false
@@ -48,9 +48,12 @@ outputs:
   image-url:
     description: 'Full URL of the pushed Docker image'
     value: ${{ steps.set-output.outputs.image-url }}
-  deployment-status:
-    description: 'Status of Render deployment (success, failed, skipped)'
-    value: ${{ steps.deploy.outputs.status }}
+  image-version:
+    description: 'Version extracted from JAR file and used for Docker image and Helm chart'
+    value: ${{ steps.set-output.outputs.image-version }}
+  helm-chart-url:
+    description: 'Full URL of the pushed Helm chart in OCI registry'
+    value: ${{ steps.helm-push.outputs.chart-url }}
 
 runs:
   using: 'composite'
@@ -62,12 +65,41 @@ runs:
         username: ${{ inputs.ghcr-username }}
         password: ${{ inputs.ghcr-token }}
 
-    - name: Verify JAR exists
+    - name: Extract version from JAR
+      id: extract-version
       shell: bash
       run: |
+        echo "Searching for JAR file..."
         ls -la target/
-        echo "JAR file location:"
-        find . -name "*.jar" -type f
+
+        # Find the JAR file (excluding sources and javadoc JARs)
+        JAR_FILE=$(find target -name "*.jar" -type f ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -n 1)
+
+        if [ -z "$JAR_FILE" ]; then
+          echo "Error: No JAR file found in target directory"
+          exit 1
+        fi
+
+        echo "Found JAR file: $JAR_FILE"
+
+        # Extract version from JAR filename
+        # Expected format: artifactId-version.jar
+        BASENAME=$(basename "$JAR_FILE" .jar)
+
+        # Try to extract version (assumes format: name-version.jar)
+        # This regex extracts everything after the last hyphen as version
+        if [[ "$BASENAME" =~ -([0-9]+\.[0-9]+\.[0-9]+(-SNAPSHOT)?(-[a-zA-Z0-9]+)?)$ ]]; then
+          VERSION="${BASH_REMATCH[1]}"
+          echo "Extracted version: $VERSION"
+        else
+          # Fallback to git SHA if version pattern not found
+          GIT_SHA="${{ github.sha }}"
+          VERSION="${GIT_SHA:0:7}"
+          echo "Could not extract version from JAR name, using git SHA: $VERSION"
+        fi
+
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "jar-file=$JAR_FILE" >> $GITHUB_OUTPUT
 
     - name: Extract metadata for Docker
       id: meta
@@ -86,21 +118,20 @@ runs:
         echo "Building Docker image from context: ${{ inputs.docker-context }}"
         ls -la ${{ inputs.docker-context }}
 
-        # Build and push with latest tag
+        VERSION="${{ steps.extract-version.outputs.version }}"
+        echo "Using version: $VERSION"
+
+        # Build and push with version tag
         docker build \
           --platform=${{ inputs.platform }} \
           --no-cache \
           -f ${{ inputs.dockerfile }} \
+          -t ${{ inputs.image-name }}:${VERSION} \
           -t ${{ inputs.image-name }}:latest \
           ${{ inputs.docker-context }}
 
+        docker push ${{ inputs.image-name }}:${VERSION}
         docker push ${{ inputs.image-name }}:latest
-
-        # Push additional tags if on deployment branch
-        if [ "${{ github.ref }}" = "refs/heads/${{ inputs.deploy-on-branch }}" ]; then
-          docker tag ${{ inputs.image-name }}:latest ${{ inputs.image-name }}:${{ inputs.deploy-on-branch }}
-          docker push ${{ inputs.image-name }}:${{ inputs.deploy-on-branch }}
-        fi
 
         # Push any additional custom tags
         if [ -n "${{ inputs.additional-tags }}" ]; then
@@ -109,7 +140,7 @@ runs:
             tag=$(echo "$tag" | xargs) # trim whitespace
             if [ -n "$tag" ]; then
               echo "Pushing additional tag: $tag"
-              docker tag ${{ inputs.image-name }}:latest ${{ inputs.image-name }}:$tag
+              docker tag ${{ inputs.image-name }}:${VERSION} ${{ inputs.image-name }}:$tag
               docker push ${{ inputs.image-name }}:$tag
             fi
           done
@@ -119,42 +150,79 @@ runs:
       id: set-output
       shell: bash
       run: |
-        echo "image-url=${{ inputs.image-name }}:latest" >> $GITHUB_OUTPUT
+        VERSION="${{ steps.extract-version.outputs.version }}"
+        echo "image-url=${{ inputs.image-name }}:${VERSION}" >> $GITHUB_OUTPUT
+        echo "image-version=${VERSION}" >> $GITHUB_OUTPUT
 
-    - name: Trigger Render deployment
-      id: deploy
-      if: inputs.enable-render-deployment == 'true' && github.ref == format('refs/heads/{0}', inputs.deploy-on-branch) && (github.event_name == 'push' || github.event_name == 'pull_request')
+    - name: Install Helm
       shell: bash
       run: |
-        echo "Triggering Render deployment with latest image..."
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        helm version
 
-        # Extract image name for URL encoding
-        IMAGE_NAME="${{ inputs.image-name }}:latest"
-        # URL encode the image URL
-        IMAGE_URL_ENCODED=$(echo "$IMAGE_NAME" | sed 's/\//%2F/g' | sed 's/:/%3A/g')
-        DEPLOY_HOOK_URL="${{ inputs.render-deploy-hook }}&imgURL=${IMAGE_URL_ENCODED}"
+    - name: Package and Push Helm Chart
+      id: helm-push
+      shell: bash
+      run: |
+        echo "Packaging Helm chart..."
 
-        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$DEPLOY_HOOK_URL")
-        HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-        BODY=$(echo "$RESPONSE" | head -n-1)
+        # Get version from JAR extraction (used for Docker image tag)
+        IMAGE_VERSION="${{ steps.extract-version.outputs.version }}"
 
-        echo "Response: $BODY"
-        echo "HTTP Status: $HTTP_CODE"
+        # Determine chart version - use provided input or default
+        CHART_VERSION="${{ inputs.chart-version }}"
 
-        if [ "$HTTP_CODE" = "200" ]; then
-          echo "✓ Render deployment triggered successfully"
-          echo "status=success" >> $GITHUB_OUTPUT
+        if [ -z "$CHART_VERSION" ]; then
+          CHART_VERSION="${IMAGE_VERSION}"
+        fi
+
+        echo "Chart Version: $CHART_VERSION"
+        echo "Docker Image Tag: $IMAGE_VERSION"
+        echo "Note: appVersion in Chart.yaml will be ignored, using image tag from values.yaml"
+
+        # Update Chart.yaml with chart version only (appVersion is ignored)
+        cd ${{ inputs.helm-chart-path }}
+
+        # Update only the chart version in Chart.yaml
+        if [ -f Chart.yaml ]; then
+          sed -i.bak "s/^version:.*/version: ${CHART_VERSION}/" Chart.yaml
+          rm -f Chart.yaml.bak
         else
-          echo "✗ Failed to trigger Render deployment (HTTP $HTTP_CODE)"
-          echo "status=failed" >> $GITHUB_OUTPUT
+          echo "Error: Chart.yaml not found in ${{ inputs.helm-chart-path }}"
           exit 1
         fi
 
-    - name: Set deployment status if skipped
-      if: inputs.enable-render-deployment != 'true' || github.ref != format('refs/heads/{0}', inputs.deploy-on-branch) || (github.event_name != 'push' && github.event_name != 'pull_request')
-      shell: bash
-      run: |
-        echo "status=skipped" >> $GITHUB_OUTPUT
+        # Update image tag in values.yaml to use the Docker image version
+        if [ -f values.yaml ]; then
+          sed -i.bak "s/tag:.*/tag: ${IMAGE_VERSION}/" values.yaml
+          rm -f values.yaml.bak
+          echo "Updated values.yaml with image tag: ${IMAGE_VERSION}"
+        fi
+
+        cd -
+
+        # Package the Helm chart
+        helm package ${{ inputs.helm-chart-path }}
+
+        # Login to GitHub Container Registry for Helm
+        echo "${{ inputs.ghcr-token }}" | helm registry login ${{ inputs.registry }} -u ${{ inputs.ghcr-username }} --password-stdin
+
+        # Extract repository owner and name from image-name
+        # Assumes format: ghcr.io/owner/repo
+        REPO_PATH=$(echo "${{ inputs.image-name }}" | sed 's|^ghcr.io/||')
+        OWNER=$(echo "$REPO_PATH" | cut -d'/' -f1)
+
+        # Push to OCI registry
+        CHART_OCI_URL="oci://${{ inputs.registry }}/${OWNER}/helm"
+        echo "Pushing chart to ${CHART_OCI_URL}"
+
+        helm push ${{ inputs.helm-chart-name }}-${CHART_VERSION}.tgz ${CHART_OCI_URL}
+
+        echo "✓ Helm chart pushed successfully"
+        echo "chart-url=${CHART_OCI_URL}/${{ inputs.helm-chart-name }}:${CHART_VERSION}" >> $GITHUB_OUTPUT
+
+        # Logout
+        helm registry logout ${{ inputs.registry }}
 
 branding:
   icon: 'upload-cloud'
