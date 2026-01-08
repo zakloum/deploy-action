@@ -43,6 +43,10 @@ inputs:
     description: 'Additional Docker tags to push (comma-separated)'
     required: false
     default: ''
+  module-path:
+    description: 'Path to Maven module containing target/ directory (for multi-module projects). Leave empty for single-module projects.'
+    required: false
+    default: ''
 
 outputs:
   image-url:
@@ -69,14 +73,31 @@ runs:
       id: extract-version
       shell: bash
       run: |
-        echo "Searching for JAR file..."
-        ls -la target/
+        # Determine target directory path based on module-path input
+        if [ -n "${{ inputs.module-path }}" ]; then
+          TARGET_DIR="${{ inputs.module-path }}/target"
+          echo "Multi-module project detected. Using target directory: $TARGET_DIR"
+        else
+          TARGET_DIR="target"
+          echo "Single-module project. Using target directory: $TARGET_DIR"
+        fi
+
+        echo "Searching for JAR file in $TARGET_DIR..."
+
+        # Check if target directory exists
+        if [ ! -d "$TARGET_DIR" ]; then
+          echo "Error: Target directory '$TARGET_DIR' does not exist"
+          echo "For multi-module projects, set the 'module-path' input to the module containing the JAR file"
+          exit 1
+        fi
+
+        ls -la "$TARGET_DIR"
 
         # Find the JAR file (excluding sources and javadoc JARs)
-        JAR_FILE=$(find target -name "*.jar" -type f ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -n 1)
+        JAR_FILE=$(find "$TARGET_DIR" -name "*.jar" -type f ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -n 1)
 
         if [ -z "$JAR_FILE" ]; then
-          echo "Error: No JAR file found in target directory"
+          echo "Error: No JAR file found in $TARGET_DIR"
           exit 1
         fi
 
@@ -100,6 +121,7 @@ runs:
 
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "jar-file=$JAR_FILE" >> $GITHUB_OUTPUT
+        echo "module-path=${{ inputs.module-path }}" >> $GITHUB_OUTPUT
 
     - name: Extract metadata for Docker
       id: meta
